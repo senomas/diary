@@ -21,6 +21,7 @@ var mdTimePattern = regexp.MustCompile(`^##\s+(\d\d:\d\d:\d\d)\s*$`)
 
 type Journal struct {
 	path   string
+	Hash   string
 	Editor string
 	Doings map[string][]Tag
 	Todos  map[string][]Tag
@@ -71,7 +72,7 @@ func OpenJournal(path string) *Journal {
 	return &journal
 }
 
-func (j *Journal) Push() {
+func (j *Journal) Commit() {
 	cmd := exec.Command("git", "-C", j.path, "add", ".")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -88,6 +89,24 @@ func (j *Journal) Push() {
 		panic(fmt.Sprintf("error run git status %#v\n", err))
 	}
 	if strings.TrimSpace(out.String()) != "" {
+		cmd = exec.Command("git", "-C", j.path, "rev-parse", "HEAD")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		err := cmd.Run()
+		if err != nil {
+			panic(fmt.Sprintf("error run git status %+v\n", err))
+		}
+		j.Hash = strings.TrimSpace(out.String())
+		j.writeConfig()
+
+		cmd = exec.Command("git", "-C", j.path, "add", ".")
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		err = cmd.Run()
+		if err != nil {
+			panic(fmt.Sprintf("error run git add %#v\n", err))
+		}
 		cmd = exec.Command("git", "-C", j.path, "commit", "-m", time.Now().Format("2006-01-02 15:04:05"))
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
@@ -97,8 +116,12 @@ func (j *Journal) Push() {
 			panic(fmt.Sprintf("error run git add %#v\n", err))
 		}
 	}
-	cmd = exec.Command("git", "-C", j.path, "pull", "--rebase")
-	err = cmd.Run()
+}
+
+func (j *Journal) Push() {
+	j.Commit()
+	cmd := exec.Command("git", "-C", j.path, "pull", "--rebase")
+	err := cmd.Run()
 	if err != nil {
 		panic(fmt.Sprintf("error run git push %#v\n", err))
 	}
@@ -109,7 +132,7 @@ func (j *Journal) Push() {
 	}
 }
 
-func (j *Journal) Write() {
+func (j *Journal) writeConfig() {
 	data, err := json.MarshalIndent(j, "", "  ")
 	if err != nil {
 		panic(fmt.Sprintf("error marshal json %+v", err))
@@ -118,6 +141,10 @@ func (j *Journal) Write() {
 	if err != nil {
 		panic(fmt.Sprintf("error write file %+v", err))
 	}
+}
+
+func (j *Journal) Write() {
+	j.writeConfig()
 	fout, err := os.Create(filepath.Join(j.path, "index.md"))
 	if err != nil {
 		panic(fmt.Sprintf("error write index file %+v", err))
@@ -134,31 +161,7 @@ func (j *Journal) Write() {
 
 	fout.Close()
 
-	cmd := exec.Command("git", "-C", j.path, "add", ".")
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err = cmd.Run()
-	if err != nil {
-		panic(fmt.Sprintf("error run git add %#v\n", err))
-	}
-	cmd = exec.Command("git", "-C", j.path, "status", "--porcelain")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	err = cmd.Run()
-	if err != nil {
-		panic(fmt.Sprintf("error run git status %#v\n", err))
-	}
-	if strings.TrimSpace(out.String()) != "" {
-		cmd = exec.Command("git", "-C", j.path, "commit", "-m", time.Now().Format("2006-01-02 15:04:05"))
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err = cmd.Run()
-		if err != nil {
-			panic(fmt.Sprintf("error run git add %#v\n", err))
-		}
-	}
+	j.Commit()
 }
 
 func (j *Journal) writeTags(out *os.File, tagMap map[string][]Tag) {
@@ -263,6 +266,10 @@ func (j *Journal) NewNote(fn string) *Note {
 }
 
 func (j *Journal) processChanges() {
+	if j.Hash == "" {
+		j.processAll()
+		return
+	}
 	cmd := exec.Command("git", "-C", j.path, "ls-files", ".", "--exclude-standard", "--others")
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -278,7 +285,7 @@ func (j *Journal) processChanges() {
 			}
 		}
 	}
-	cmd = exec.Command("git", "-C", j.path, "status", "--porcelain")
+	cmd = exec.Command("git", "-C", j.path, "diff", j.Hash, "--name-only")
 	out = bytes.Buffer{}
 	cmd.Stdout = &out
 	err = cmd.Run()
@@ -287,10 +294,11 @@ func (j *Journal) processChanges() {
 	}
 	for _, fn := range strings.Split(out.String(), "\n") {
 		if strings.HasSuffix(fn, ".md") {
-			fn = strings.TrimSpace(fn)
-			fn = strings.TrimSpace(fn[strings.IndexAny(fn, " "):])
-			if _, ok := changes[fn]; !ok {
-				changes[fn] = j.NewNote(fn)
+			ff := filepath.Join(j.path, fn)
+			if _, err := os.Stat(ff); err == nil {
+				if _, ok := changes[fn]; !ok {
+					changes[fn] = j.NewNote(fn)
+				}
 			}
 		}
 	}
@@ -301,6 +309,9 @@ func (j *Journal) processChanges() {
 
 func (j *Journal) processAll() {
 	pl := len(j.path)
+	j.Doings = make(map[string][]Tag)
+	j.Todos = make(map[string][]Tag)
+	j.Laters = make(map[string][]Tag)
 	filepath.WalkDir(j.path, func(path string, d fs.DirEntry, err error) error {
 		if d.Name() == ".git" {
 			return filepath.SkipDir
@@ -319,6 +330,12 @@ func (j *Journal) processAll() {
 func (n *Note) process() {
 	fin, err := os.Open(filepath.Join(n.journal.path, n.Path))
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			delete(n.journal.Doings, n.Path)
+			delete(n.journal.Todos, n.Path)
+			delete(n.journal.Laters, n.Path)
+			return
+		}
 		panic(fmt.Sprintf("error processing '%s' %+v\n", n.Path, err))
 	}
 	defer fin.Close()
@@ -370,7 +387,19 @@ func (n *Note) process() {
 		}
 		lineNo++
 	}
-	n.journal.Doings[n.Path] = doings
-	n.journal.Todos[n.Path] = todos
-	n.journal.Laters[n.Path] = laters
+	if len(doings) > 0 {
+		n.journal.Doings[n.Path] = doings
+	} else {
+		delete(n.journal.Doings, n.Path)
+	}
+	if len(todos) > 0 {
+		n.journal.Todos[n.Path] = todos
+	} else {
+		delete(n.journal.Todos, n.Path)
+	}
+	if len(laters) > 0 {
+		n.journal.Laters[n.Path] = laters
+	} else {
+		delete(n.journal.Laters, n.Path)
+	}
 }
