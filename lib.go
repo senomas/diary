@@ -12,12 +12,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
 
 var dpattern = regexp.MustCompile(`^(\d\d\d\d)/(\d\d)/(\d\d\d\d)-(\d\d)-(\d\d)\.md$`)
 var mdTimePattern = regexp.MustCompile(`^##\s+(\d\d:\d\d:\d\d)\s*$`)
+var tagPattern = regexp.MustCompile(`^#\w.*$`)
+var headerPattern = regexp.MustCompile(`^#+\s+(.*)`)
 
 type Journal struct {
 	path   string
@@ -26,6 +29,8 @@ type Journal struct {
 	Doings map[string][]Tag
 	Todos  map[string][]Tag
 	Laters map[string][]Tag
+	Diary  map[string][][]string
+	Tags   map[string][]Tag
 }
 
 type NoteType int8
@@ -46,7 +51,27 @@ type Tag struct {
 	note   *Note
 	Time   time.Time
 	LineNo int
+	Tag    string
 	Text   string
+}
+
+type TagCount struct {
+	Tag   string
+	Count int
+}
+
+type TagCounts []TagCount
+
+func (tc TagCounts) Len() int {
+	return len(tc)
+}
+
+func (tc TagCounts) Less(i, j int) bool {
+	return tc[i].Count < tc[j].Count
+}
+
+func (tc TagCounts) Swap(i, j int) {
+	tc[i], tc[j] = tc[j], tc[i]
 }
 
 func OpenJournal(path string) *Journal {
@@ -158,6 +183,30 @@ func (j *Journal) Write() {
 
 	fout.WriteString("\n# LATER\n\n")
 	j.writeTags(fout, j.Laters)
+
+	fout.WriteString("\n\n---\n\n# TAG\n")
+	tags := make(map[string][]Tag)
+	for _, ts := range j.Tags {
+		for _, t := range ts {
+			if ta, ok := tags[t.Tag]; ok {
+				tags[t.Tag] = append(ta, t)
+			} else {
+				tags[t.Tag] = []Tag{t}
+			}
+		}
+	}
+	var tagCounts TagCounts
+	for tag, v := range tags {
+		tagCounts = append(tagCounts, TagCount{tag, len(v)})
+	}
+	sort.Sort(sort.Reverse(tagCounts))
+	for k, ts := range tags {
+		k := k[1:]
+		fout.WriteString(fmt.Sprintf("\n## %s\n", k))
+		for _, t := range ts {
+			fout.WriteString(fmt.Sprintf("%s\n", t.Text))
+		}
+	}
 
 	fout.Close()
 
@@ -312,6 +361,8 @@ func (j *Journal) processAll() {
 	j.Doings = make(map[string][]Tag)
 	j.Todos = make(map[string][]Tag)
 	j.Laters = make(map[string][]Tag)
+	j.Diary = make(map[string][][]string)
+	j.Tags = make(map[string][]Tag)
 	filepath.WalkDir(j.path, func(path string, d fs.DirEntry, err error) error {
 		if d.Name() == ".git" {
 			return filepath.SkipDir
@@ -328,12 +379,16 @@ func (j *Journal) processAll() {
 }
 
 func (n *Note) process() {
+	if strings.HasSuffix(n.Path, "/index.md") || n.Path == "index.md" {
+		return
+	}
 	fin, err := os.Open(filepath.Join(n.journal.path, n.Path))
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			delete(n.journal.Doings, n.Path)
 			delete(n.journal.Todos, n.Path)
 			delete(n.journal.Laters, n.Path)
+			delete(n.journal.Tags, n.Path)
 			return
 		}
 		panic(fmt.Sprintf("error processing '%s' %+v\n", n.Path, err))
@@ -347,6 +402,7 @@ func (n *Note) process() {
 	var doings []Tag
 	var todos []Tag
 	var laters []Tag
+	var tags []Tag
 	for scanner.Scan() {
 		text := scanner.Text()
 		if ms := mdTimePattern.FindAllStringSubmatch(text, -1); ms != nil {
@@ -360,30 +416,52 @@ func (n *Note) process() {
 		var todo = false
 		var later = false
 		var texts []string
+		var ttexts []string
+		var ctags []string
 		for _, w := range strings.Fields(text) {
 			switch w {
 			case "*DOING*":
 				doing = true
-				texts = append(texts, fmt.Sprintf("*[DOING](%s)*", n.Path))
+				texts = append(texts, fmt.Sprintf("*[DOING](%s#%s)*", n.Path, nt))
+				ttexts = append(ttexts, w)
 			case "*TODO*":
 				todo = true
-				texts = append(texts, fmt.Sprintf("*[TODO](%s)*", n.Path))
+				texts = append(texts, fmt.Sprintf("*[TODO](%s#%s)*", n.Path, nt))
+				ttexts = append(ttexts, w)
 			case "*LATER*":
 				later = true
-				texts = append(texts, fmt.Sprintf("*[LATER](%s)*", n.Path))
+				texts = append(texts, fmt.Sprintf("*[LATER](%s#%s)*", n.Path, nt))
+				ttexts = append(ttexts, w)
 			default:
+				if tagPattern.MatchString(w) {
+					ctags = append(ctags, w)
+					ttexts = append(ttexts, fmt.Sprintf("[%s](%s#%s)", w, n.Path, nt))
+				} else {
+					ttexts = append(ttexts, w)
+				}
 				texts = append(texts, w)
 			}
 		}
+		ftext := strings.Join(texts, " ")
 		if doing {
-			doings = append(doings, Tag{note: n, Time: ctime, LineNo: lineNo, Text: strings.Join(texts, " ")})
+			doings = append(doings, Tag{note: n, Time: ctime, LineNo: lineNo, Text: ftext})
 		}
 		if todo {
-			todos = append(todos, Tag{note: n, Time: ctime, LineNo: lineNo, Text: strings.Join(texts, " ")})
-
+			todos = append(todos, Tag{note: n, Time: ctime, LineNo: lineNo, Text: ftext})
 		}
 		if later {
-			laters = append(laters, Tag{note: n, Time: ctime, LineNo: lineNo, Text: strings.Join(texts, " ")})
+			laters = append(laters, Tag{note: n, Time: ctime, LineNo: lineNo, Text: ftext})
+		}
+		if len(ctags) > 0 {
+			ftext = strings.Join(ttexts, " ")
+			if ms := headerPattern.FindAllStringSubmatch(ftext, -1); ms != nil && len(ms) == 1 && len(ms[0]) == 2 {
+				ftext = "- " + ms[0][1]
+			} else if !strings.HasPrefix(ftext, "- ") {
+				ftext = "- " + ftext
+			}
+			for _, t := range ctags {
+				tags = append(tags, Tag{note: n, Time: ctime, LineNo: lineNo, Tag: t, Text: ftext})
+			}
 		}
 		lineNo++
 	}
@@ -401,5 +479,25 @@ func (n *Note) process() {
 		n.journal.Laters[n.Path] = laters
 	} else {
 		delete(n.journal.Laters, n.Path)
+	}
+	if len(tags) > 0 {
+		n.journal.Tags[n.Path] = tags
+	} else {
+		delete(n.journal.Tags, n.Path)
+	}
+	now := time.Now()
+	lastYearMonth := now.Year()*12 + int(now.Month()) - 3
+	if ms := dpattern.FindAllStringSubmatch(n.Path, -1); ms != nil && len(ms) == 1 && len(ms[0]) == 6 && ms[0][1] == ms[0][3] && ms[0][2] == ms[0][4] {
+		dt := fmt.Sprintf("%s-%s-%sT00:00:00", ms[0][3], ms[0][4], ms[0][5])
+		dtime, err := time.ParseInLocation("2006-01-02T15:04:05", dt, time.Local)
+		if err != nil {
+			panic(fmt.Sprintf("error date format '%s' %+v", dt, err))
+		}
+		yearMonth := dtime.Year()*12 + int(dtime.Month()) - 1
+		delta := yearMonth - lastYearMonth
+		if delta > 0 {
+			dtg := fmt.Sprintf("%s-%s", ms[0][3], ms[0][4])
+			n.journal.Diary[dtg] = append(n.journal.Diary[dtg], []string{ms[0][5], n.Path})
+		}
 	}
 }
