@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -192,6 +193,9 @@ func (j *Journal) writeTags(out *os.File, tagMap map[string][]Tag) {
 			tags = append(tags, t)
 		}
 	}
+	sort.Slice(tags, func(i, j int) bool {
+		return tags[i].Time.After(tags[j].Time)
+	})
 	for _, t := range tags {
 		out.WriteString(fmt.Sprintf("%s\n", t.Text))
 	}
